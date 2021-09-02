@@ -330,36 +330,47 @@ handle(<<"GET">>, [<<"chunk">>, OffsetBinary], Req, _Pid) ->
 			case << Offset:(?NOTE_SIZE * 8) >> of
 				%% A positive number represented by =< ?NOTE_SIZE bytes.
 				<< Offset:(?NOTE_SIZE * 8) >> ->
-					Type =
-						case cowboy_req:header(<<"x-packing-key">>, Req, not_set) of
+					RequestedPacking =
+						case cowboy_req:header(<<"x-packing">>, Req, not_set) of
 							not_set ->
 								unpacked;
-							<<"aes_256_cbc">> ->
-								aes_256_cbc;
+							<<"unpacked">> ->
+								unpacked;
+							<<"spora_2_5">> ->
+								spora_2_5;
 							_ ->
-								aes_256_cbc
+								any
 						end,
-					CheckRecords =
-						case ar_sync_record:is_recorded(Offset, Type, ar_data_sync) of
-							true ->
-								ok = ar_semaphore:acquire(get_chunk, infinity),
-								ok;
+					IsBucketBasedOffset =
+						case cowboy_req:header(<<"x-bucket-based-offset">>, Req, not_set) of
+							not_set ->
+								false;
+							_ ->
+								true
+						end,
+					{ReadPacking, CheckRecords} =
+						case ar_sync_record:is_recorded(Offset, ar_data_sync) of
 							false ->
-								case ar_sync_record:is_recorded(Offset, ar_data_sync) of
-									{true, _} ->
-										ok = ar_semaphore:acquire(get_and_pack_chunk, infinity),
-										ok;
-									false ->
-										{reply, {404, #{}, <<>>, Req}}
-								end
+								{none, {reply, {404, #{}, <<>>, Req}}};
+							{true, RequestedPacking} ->
+								ok = ar_semaphore:acquire(get_chunk, infinity),
+								{RequestedPacking, ok};
+							{true, Packing} when RequestedPacking == any ->
+								ok = ar_semaphore:acquire(get_chunk, infinity),
+								{Packing, ok};
+							{true, _} ->
+								ok = ar_semaphore:acquire(get_and_pack_chunk, infinity),
+								{RequestedPacking, ok}
 						end,
 					case CheckRecords of
 						{reply, Reply} ->
 							Reply;
 						ok ->
-							case ar_data_sync:get_chunk(Offset, #{ packing => Type }) of
+							Args = #{ packing => ReadPacking,
+									bucket_based_offset => IsBucketBasedOffset },
+							case ar_data_sync:get_chunk(Offset, Args) of
 								{ok, Proof} ->
-									Proof2 = Proof#{ packing => Type },
+									Proof2 = Proof#{ packing => ReadPacking },
 									Reply =
 										jiffy:encode(
 											ar_serialize:chunk_proof_to_json_map(Proof2)
@@ -810,8 +821,14 @@ handle(<<"GET">>, [<<"block">>, Type, ID], Req, Pid)
 			case hash_to_filename(block, ID) of
 				{error, invalid} ->
 					{400, #{}, <<"Invalid hash.">>, Req};
-				{error, _, unavailable} ->
-					{404, #{}, <<"Block not found.">>, Req};
+				{error, DecodedID, unavailable} ->
+					case ar_randomx_state:get_key_block(DecodedID) of
+						not_found ->
+							{404, #{}, <<"Block not found.">>, Req};
+						{ok, B} ->
+							{200, #{}, ar_serialize:jsonify(ar_serialize:block_to_json_struct(B)),
+									Req}
+					end;
 				{ok, Filename} ->
 					{200, #{}, sendfile(Filename), Req}
 			end;
@@ -1127,7 +1144,8 @@ estimate_tx_fee(Size, Addr) ->
 				{ScheduledDividend, ScheduledDivisor}
 		end,
 	RootHash = proplists:get_value(wallet_list, Props),
-	estimate_tx_fee(Size, Rate, Height + 1, Addr, RootHash).
+	PaidSize = ar_tx:get_weave_size_increase(Size, Height + 1),
+	estimate_tx_fee(PaidSize, Rate, Height + 1, Addr, RootHash).
 
 estimate_tx_fee(Size, Rate, Height, Addr, RootHash) ->
 	Timestamp = os:system_time(second),
@@ -1659,12 +1677,17 @@ post_block(check_difficulty, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimest
 %% the network.
 post_block(check_pow, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimestamp) ->
 	Nonce = BShadow#block.nonce,
-	#block{ height = PrevHeight } = PrevB,
+	#block{ indep_hash = PrevH, height = PrevHeight } = PrevB,
 	Height = PrevHeight + 1,
 	MaybeValid =
 		case Height >= ar_fork:height_2_4() of
 			true ->
-				validate_spora_pow(BShadow, PrevB, BDS);
+				case ar_node:get_recent_search_space_upper_bound_by_prev_h(PrevH) of
+					not_found ->
+						{reply, {412, #{}, <<>>, Req}};
+					SearchSpaceUpperBound ->
+						validate_spora_pow(BShadow, PrevB, BDS, SearchSpaceUpperBound)
+				end;
 			false ->
 				case ar_mine:validate(BDS, Nonce, BShadow#block.diff, Height) of
 					{invalid, _} ->
@@ -1674,6 +1697,8 @@ post_block(check_pow, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimestamp) ->
 				end
 		end,
 	case MaybeValid of
+		{reply, Reply} ->
+			Reply;
 		true ->
 			post_block(post_block, {BShadow, OrigPeer, BDS}, Req, ReceiveTimestamp);
 		false ->
@@ -1701,28 +1726,57 @@ compute_hash(B, Height) ->
 			{BDS, ar_weave:indep_hash(BDS, Hash, Nonce)}
 	end.
 
-validate_spora_pow(B, PrevB, BDS) ->
-	#block{
-		height = PrevHeight,
-		indep_hash = PrevH
-	} = PrevB,
-	#block{
-		height = Height,
-		nonce = Nonce,
-		timestamp = Timestamp,
-		poa = #poa{ chunk = Chunk }
-	} = B,
+validate_spora_pow(B, PrevB, BDS, SearchSpaceUpperBound) ->
+	#block{ height = PrevHeight, indep_hash = PrevH } = PrevB,
+	#block{ height = Height, nonce = Nonce, timestamp = Timestamp,
+			poa = #poa{ chunk = Chunk } = SPoA } = B,
 	Root = ar_block:compute_hash_list_merkle(PrevB),
 	case {Root, PrevHeight + 1} == {B#block.hash_list_merkle, Height} of
 		false ->
 			false;
 		true ->
-			H0 = ar_weave:hash(BDS, Nonce, Height),
-			SolutionHash =
-				ar_mine:spora_solution_hash(PrevH, Timestamp, H0, Chunk, Height),
-			ar_mine:validate(SolutionHash, B#block.diff, Height)
-				andalso SolutionHash == B#block.hash
+			{H0, Entropy} = ar_mine:spora_h0_with_entropy(BDS, Nonce, Height),
+			ComputeSolutionHash =
+				case ar_mine:pick_recall_byte(H0, PrevH, SearchSpaceUpperBound) of
+					{error, weave_size_too_small} ->
+						case SPoA == #poa{} of
+							false ->
+								false;
+							true ->
+								ar_mine:spora_solution_hash(PrevH, Timestamp, H0, Chunk, Height)
+						end;
+					{ok, RecallByte} ->
+						PackingThreshold = ar_block:get_packing_threshold(PrevB,
+								SearchSpaceUpperBound),
+						case verify_packing_threshold(B, PackingThreshold) of
+							false ->
+								false;
+							true ->
+								case RecallByte >= PackingThreshold of
+									true ->
+										ar_mine:spora_solution_hash_with_entropy(PrevH,
+												Timestamp, H0, Chunk, Entropy, Height);
+									false ->
+										ar_mine:spora_solution_hash(PrevH, Timestamp, H0, Chunk,
+												Height)
+								end
+						end
+				end,
+			case ComputeSolutionHash of
+				false ->
+					false;
+				SolutionHash ->
+					ar_mine:validate(SolutionHash, B#block.diff, Height)
+						andalso SolutionHash == B#block.hash
+			end
 	end.
+
+verify_packing_threshold(_B, undefined) ->
+	true;
+verify_packing_threshold(#block{ packing_2_5_threshold = PackingThreshold }, PackingThreshold) ->
+	true;
+verify_packing_threshold(_, _) ->
+	false.
 
 post_block_reject_warn(BShadow, Step, Peer) ->
 	?LOG_WARNING([

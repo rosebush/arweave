@@ -1509,7 +1509,7 @@ remove_orphaned_data_root_offsets(State, BlockStartOffset, WeaveSize) ->
 
 have_free_space() ->
 	ar_storage:get_free_space(?ROCKS_DB_DIR) > ?DISK_DATA_BUFFER_SIZE
-		andalso ar_storage:get_free_space(?CHUNK_DIR) > ?DISK_DATA_BUFFER_SIZE.
+		andalso (ar_storage:get_free_space(?CHUNK_DIR) > ?DISK_DATA_BUFFER_SIZE orelse ar_multi_dir:have_valid_free_space()).
 
 add_block(B, SizeTaggedTXs, State) ->
 	#sync_data_state{

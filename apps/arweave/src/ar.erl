@@ -276,6 +276,8 @@ parse_cli_args(["peer", Peer|Rest], C = #config { peers = Ps }) ->
 			io:format("Peer ~p invalid ~n", [Peer]),
 			parse_cli_args(Rest, C)
 	end;
+parse_cli_args(["chunk_dir_cfg", Filepath|Rest], C) ->
+	parse_cli_args(Rest, C#config { chunk_directories = ar_multi_dir:read_dir_cfg(Filepath)});
 parse_cli_args(["transaction_blacklist", File|Rest], C = #config { transaction_blacklist_files = Files } ) ->
 	parse_cli_args(Rest, C#config { transaction_blacklist_files = [File|Files] });
 parse_cli_args(["transaction_blacklist_url", URL | Rest], C = #config { transaction_blacklist_urls = URLs} ) ->

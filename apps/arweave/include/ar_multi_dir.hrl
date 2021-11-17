@@ -1,0 +1,1 @@
+-define(DIR_VALID_SPACE_SIZE, 20 * 1024 * 1024 * 1024). % >15 GiB ~5 mins of syncing at 60 MiB/s

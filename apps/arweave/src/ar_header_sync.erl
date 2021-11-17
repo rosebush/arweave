@@ -342,7 +342,7 @@ have_free_space() ->
 	ar_storage:get_free_space(".") > ?DISK_HEADERS_BUFFER_SIZE
 		%% RocksDB and the chunk storage contain v1 data, which is part of the headers.
 		andalso ar_storage:get_free_space(?ROCKS_DB_DIR) > ?DISK_HEADERS_BUFFER_SIZE
-			andalso ar_storage:get_free_space(?CHUNK_DIR) > ?DISK_HEADERS_BUFFER_SIZE.
+			andalso (ar_storage:get_free_space(?CHUNK_DIR) > ?DISK_HEADERS_BUFFER_SIZE orelse ar_multi_dir:have_valid_free_space()).
 
 cast_after(Delay, Message) ->
 	%% Not using timer:apply_after here because send_after is more efficient:

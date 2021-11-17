@@ -20,6 +20,7 @@
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_config.hrl").
 -include_lib("arweave/include/ar_chunk_storage.hrl").
+-include_lib("arweave/include/ar_multi_dir.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -54,7 +55,7 @@ open_files() ->
 		fun({Key, Filename}, _) ->
 			case erlang:get({cfile, Key}) of
 				undefined ->
-					Filepath = filename:join([DataDir, ?CHUNK_DIR, Filename]),
+					Filepath = ar_multi_dir:get_read_filename([DataDir, ?CHUNK_DIR, Filename]),
 					case file:open(Filepath, [read, raw, binary]) of
 						{ok, F} ->
 							erlang:put({cfile, Key}, F);
@@ -223,8 +224,7 @@ get_key(Offset) ->
 store_chunk(Key, Offset, Chunk, FileIndex) ->
 	Filename = filename(Key, FileIndex),
 	{ok, Config} = application:get_env(arweave, config),
-	Dir = filename:join(Config#config.data_dir, ?CHUNK_DIR),
-	Filepath = filename:join(Dir, Filename),
+	Filepath = ar_multi_dir:get_write_filename(Config#config.data_dir, ?CHUNK_DIR,Filename),
 	store_chunk(Key, Offset, Chunk, Filename, Filepath).
 
 filename(Key, FileIndex) ->
@@ -330,7 +330,7 @@ get(Byte, Start, Key) ->
 read_chunk(Byte, Start, Key, Filename) ->
 	{ok, Config} = application:get_env(arweave, config),
 	DataDir = Config#config.data_dir,
-	Filepath = filename:join([DataDir, ?CHUNK_DIR, Filename]),
+	Filepath = ar_multi_dir:get_read_filename([DataDir, ?CHUNK_DIR, Filename]),
 	case file:open(Filepath, [read, raw, binary]) of
 		{error, enoent} ->
 			not_found;

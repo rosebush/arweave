@@ -24,7 +24,7 @@
 	write_term/2, write_term/3, read_term/1, read_term/2, delete_term/1
 ]).
 
--export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
+-export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2, get_disk_data/1]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_config.hrl").

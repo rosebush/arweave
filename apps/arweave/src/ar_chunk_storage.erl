@@ -224,7 +224,7 @@ get_key(Offset) ->
 store_chunk(Key, Offset, Chunk, FileIndex) ->
 	Filename = filename(Key, FileIndex),
 	{ok, Config} = application:get_env(arweave, config),
-	Filepath = ar_multi_dir:get_write_filename(Config#config.data_dir, ?CHUNK_DIR,Filename),
+	Filepath = ar_multi_dir:get_write_filename([Config#config.data_dir, ?CHUNK_DIR, Filename]),
 	store_chunk(Key, Offset, Chunk, Filename, Filepath).
 
 filename(Key, FileIndex) ->

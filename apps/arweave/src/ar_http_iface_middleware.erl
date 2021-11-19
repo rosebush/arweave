@@ -8,6 +8,7 @@
 -include_lib("arweave/include/ar_config.hrl").
 -include_lib("arweave/include/ar_pricing.hrl").
 -include_lib("arweave/include/ar_data_sync.hrl").
+-include_lib("arweave/include/ar_data_discovery.hrl").
 -include_lib("arweave/include/ar_mine.hrl").
 
 -define(HANDLER_TIMEOUT, 55000).
@@ -283,6 +284,22 @@ handle(<<"GET">>, [<<"tx">>, Hash, << "data.", _/binary >>], Req, _Pid) ->
 			end
 	end;
 
+handle(<<"GET">>, [<<"sync_buckets">>], Req, _Pid) ->
+	case ar_node:is_joined() of
+		false ->
+			not_joined(Req);
+		true ->
+			ok = ar_semaphore:acquire(get_sync_record, infinity),
+			case ar_sync_record:get_serialized_sync_buckets(ar_data_sync) of
+				{ok, Binary} ->
+					{200, #{}, Binary, Req};
+				{error, not_initialized} ->
+					{500, #{}, jiffy:encode(#{ error => not_initialized }), Req};
+				{error, timeout} ->
+					{503, #{}, jiffy:encode(#{ error => timeout }), Req}
+			end
+	end;
+
 handle(<<"GET">>, [<<"data_sync_record">>], Req, _Pid) ->
 	case ar_node:is_joined() of
 		false ->
@@ -330,36 +347,47 @@ handle(<<"GET">>, [<<"chunk">>, OffsetBinary], Req, _Pid) ->
 			case << Offset:(?NOTE_SIZE * 8) >> of
 				%% A positive number represented by =< ?NOTE_SIZE bytes.
 				<< Offset:(?NOTE_SIZE * 8) >> ->
-					Type =
-						case cowboy_req:header(<<"x-packing-key">>, Req, not_set) of
+					RequestedPacking =
+						case cowboy_req:header(<<"x-packing">>, Req, not_set) of
 							not_set ->
 								unpacked;
-							<<"aes_256_cbc">> ->
-								aes_256_cbc;
+							<<"unpacked">> ->
+								unpacked;
+							<<"spora_2_5">> ->
+								spora_2_5;
 							_ ->
-								aes_256_cbc
+								any
 						end,
-					CheckRecords =
-						case ar_sync_record:is_recorded(Offset, Type, ar_data_sync) of
-							true ->
-								ok = ar_semaphore:acquire(get_chunk, infinity),
-								ok;
+					IsBucketBasedOffset =
+						case cowboy_req:header(<<"x-bucket-based-offset">>, Req, not_set) of
+							not_set ->
+								false;
+							_ ->
+								true
+						end,
+					{ReadPacking, CheckRecords} =
+						case ar_sync_record:is_recorded(Offset, ar_data_sync) of
 							false ->
-								case ar_sync_record:is_recorded(Offset, ar_data_sync) of
-									{true, _} ->
-										ok = ar_semaphore:acquire(get_and_pack_chunk, infinity),
-										ok;
-									false ->
-										{reply, {404, #{}, <<>>, Req}}
-								end
+								{none, {reply, {404, #{}, <<>>, Req}}};
+							{true, RequestedPacking} ->
+								ok = ar_semaphore:acquire(get_chunk, infinity),
+								{RequestedPacking, ok};
+							{true, Packing} when RequestedPacking == any ->
+								ok = ar_semaphore:acquire(get_chunk, infinity),
+								{Packing, ok};
+							{true, _} ->
+								ok = ar_semaphore:acquire(get_and_pack_chunk, infinity),
+								{RequestedPacking, ok}
 						end,
 					case CheckRecords of
 						{reply, Reply} ->
 							Reply;
 						ok ->
-							case ar_data_sync:get_chunk(Offset, #{ packing => Type }) of
+							Args = #{ packing => ReadPacking,
+									bucket_based_offset => IsBucketBasedOffset },
+							case ar_data_sync:get_chunk(Offset, Args) of
 								{ok, Proof} ->
-									Proof2 = Proof#{ packing => Type },
+									Proof2 = Proof#{ packing => ReadPacking },
 									Reply =
 										jiffy:encode(
 											ar_serialize:chunk_proof_to_json_map(Proof2)
@@ -554,7 +582,8 @@ handle(<<"GET">>, [<<"peers">>], Req, _Pid) ->
 				list_to_binary(ar_util:format_peer(P))
 			||
 				P <- ar_bridge:get_remote_peers(),
-				P /= ar_http_util:arweave_peer(Req)
+				P /= ar_http_util:arweave_peer(Req),
+				ar_manage_peers:is_public_peer(P)
 			]
 		),
 	Req};
@@ -582,7 +611,7 @@ handle(<<"GET">>, [<<"price">>, SizeInBytesBinary, Addr], Req, _Pid) ->
 		false ->
 			not_joined(Req);
 		true ->
-			case ar_util:safe_decode(Addr) of
+			case ar_wallet:base64_address_with_optional_checksum_to_decoded_address_safe(Addr) of
 				{error, invalid} ->
 					{400, #{}, <<"Invalid address.">>, Req};
 				{ok, AddrOK} ->
@@ -623,7 +652,7 @@ handle(<<"GET">>, [<<"wallet_list">>], Req, _Pid) ->
 			not_joined(Req);
 		true ->
 			H = ar_node:get_current_block_hash(),
-			process_request(get_block, [<<"hash">>, H, <<"wallet_list">>], Req)
+			process_request(get_block, [<<"hash">>, ar_util:encode(H), <<"wallet_list">>], Req)
 	end;
 
 %% Return a bunch of wallets, up to ?WALLET_LIST_CHUNK_SIZE, from the tree with
@@ -682,7 +711,7 @@ handle(<<"GET">>, [<<"wallet">>, Addr, <<"balance">>], Req, _Pid) ->
 		false ->
 			not_joined(Req);
 		true ->
-			case ar_util:safe_decode(Addr) of
+			case ar_wallet:base64_address_with_optional_checksum_to_decoded_address_safe(Addr) of
 				{error, invalid} ->
 					{400, #{}, <<"Invalid address.">>, Req};
 				{ok, AddrOK} ->
@@ -705,7 +734,7 @@ handle(<<"GET">>, [<<"wallet">>, Addr, <<"last_tx">>], Req, _Pid) ->
 		false ->
 			not_joined(Req);
 		true ->
-			case ar_util:safe_decode(Addr) of
+			case ar_wallet:base64_address_with_optional_checksum_to_decoded_address_safe(Addr) of
 				{error, invalid} ->
 					{400, #{}, <<"Invalid address.">>, Req};
 				{ok, AddrOK} ->
@@ -810,8 +839,14 @@ handle(<<"GET">>, [<<"block">>, Type, ID], Req, Pid)
 			case hash_to_filename(block, ID) of
 				{error, invalid} ->
 					{400, #{}, <<"Invalid hash.">>, Req};
-				{error, _, unavailable} ->
-					{404, #{}, <<"Block not found.">>, Req};
+				{error, DecodedID, unavailable} ->
+					case ar_randomx_state:get_key_block(DecodedID) of
+						not_found ->
+							{404, #{}, <<"Block not found.">>, Req};
+						{ok, B} ->
+							{200, #{}, ar_serialize:jsonify(ar_serialize:block_to_json_struct(B)),
+									Req}
+					end;
 				{ok, Filename} ->
 					{200, #{}, sendfile(Filename), Req}
 			end;
@@ -844,18 +879,13 @@ handle(<<"GET">>, [<<"block">>, Type, ID], Req, Pid)
 	end;
 
 %% Return block or block field.
-handle(<<"GET">>, [<<"block">>, Type, IDBin, Field], Req, _Pid)
+handle(<<"GET">>, [<<"block">>, Type, ID, Field], Req, _Pid)
 		when Type == <<"height">> orelse Type == <<"hash">> ->
 	case ar_node:is_joined() of
 		false ->
 			not_joined(Req);
 		true ->
-			case validate_get_block_type_id(Type, IDBin) of
-				{error, {Status, Headers, Body}} ->
-					{Status, Headers, Body, Req};
-				{ok, ID} ->
-					process_request(get_block, [Type, ID, Field], Req)
-			end
+			process_request(get_block, [Type, ID, Field], Req)
 	end;
 
 %% Return the current block.
@@ -992,7 +1022,7 @@ not_joined(Req) ->
 handle_get_tx_status(EncodedTXID, Req) ->
 	case ar_util:safe_decode(EncodedTXID) of
 		{error, invalid} ->
-			{400, #{}, <<"Invalid address.">>};
+			{400, #{}, <<"Invalid address.">>, Req};
 		{ok, TXID} ->
 			case is_a_pending_tx(TXID) of
 				true ->
@@ -1114,20 +1144,15 @@ estimate_tx_fee(Size, Addr) ->
 					{'==', '$1', scheduled_usd_to_ar_rate}}], ['$_']}]
 		),
 	Height = proplists:get_value(height, Props),
-	{Dividend, Divisor} = proplists:get_value(usd_to_ar_rate, Props),
-	{ScheduledDividend, ScheduledDivisor} = proplists:get_value(scheduled_usd_to_ar_rate, Props),
+	CurrentRate = proplists:get_value(usd_to_ar_rate, Props),
+	ScheduledRate = proplists:get_value(scheduled_usd_to_ar_rate, Props),
 	%% Of the two rates - the currently active one and the one scheduled to be
 	%% used soon - pick the one that leads to a higher fee in AR to make sure the
 	%% transaction does not become underpaid.
-	Rate =
-		case Dividend * ScheduledDivisor =< Divisor * ScheduledDividend of
-			true ->
-				{Dividend, Divisor};
-			false ->
-				{ScheduledDividend, ScheduledDivisor}
-		end,
+	Rate = ar_fraction:maximum(CurrentRate, ScheduledRate),
 	RootHash = proplists:get_value(wallet_list, Props),
-	estimate_tx_fee(Size, Rate, Height + 1, Addr, RootHash).
+	PaidSize = ar_tx:get_weave_size_increase(Size, Height + 1),
+	estimate_tx_fee(PaidSize, Rate, Height + 1, Addr, RootHash).
 
 estimate_tx_fee(Size, Rate, Height, Addr, RootHash) ->
 	Timestamp = os:system_time(second),
@@ -1140,7 +1165,7 @@ estimate_tx_fee(Size, Rate, Height, Addr, RootHash) ->
 	end.
 
 handle_get_wallet_txs(Addr, EarliestTXID) ->
-	case ar_util:safe_decode(Addr) of
+	case ar_wallet:base64_address_with_optional_checksum_to_decoded_address_safe(Addr) of
 		{error, invalid} ->
 			{400, #{}, <<"Invalid address.">>};
 		{ok, _} ->
@@ -1407,18 +1432,18 @@ log_internal_api_reject(Msg, Req) ->
 	end).
 
 %% @doc Convert a blocks field with the given label into a string.
-block_field_to_string(<<"nonce">>, Res) -> Res;
-block_field_to_string(<<"previous_block">>, Res) -> Res;
 block_field_to_string(<<"timestamp">>, Res) -> integer_to_list(Res);
 block_field_to_string(<<"last_retarget">>, Res) -> integer_to_list(Res);
 block_field_to_string(<<"diff">>, Res) -> integer_to_list(Res);
+block_field_to_string(<<"cumulative_diff">>, Res) -> integer_to_list(Res);
 block_field_to_string(<<"height">>, Res) -> integer_to_list(Res);
-block_field_to_string(<<"hash">>, Res) -> Res;
-block_field_to_string(<<"indep_hash">>, Res) -> Res;
 block_field_to_string(<<"txs">>, Res) -> ar_serialize:jsonify(Res);
 block_field_to_string(<<"hash_list">>, Res) -> ar_serialize:jsonify(Res);
 block_field_to_string(<<"wallet_list">>, Res) -> ar_serialize:jsonify(Res);
-block_field_to_string(<<"reward_addr">>, Res) -> Res.
+block_field_to_string(<<"usd_to_ar_rate">>, Res) -> ar_serialize:jsonify(Res);
+block_field_to_string(<<"scheduled_usd_to_ar_rate">>, Res) -> ar_serialize:jsonify(Res);
+block_field_to_string(<<"poa">>, Res) -> ar_serialize:jsonify(Res);
+block_field_to_string(_, Res) -> Res.
 
 hash_to_filename(Type, Hash) ->
 	case hash_to_filename_from_diskcache(Type, Hash) of
@@ -1659,12 +1684,17 @@ post_block(check_difficulty, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimest
 %% the network.
 post_block(check_pow, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimestamp) ->
 	Nonce = BShadow#block.nonce,
-	#block{ height = PrevHeight } = PrevB,
+	#block{ indep_hash = PrevH, height = PrevHeight } = PrevB,
 	Height = PrevHeight + 1,
 	MaybeValid =
 		case Height >= ar_fork:height_2_4() of
 			true ->
-				validate_spora_pow(BShadow, PrevB, BDS);
+				case ar_node:get_recent_search_space_upper_bound_by_prev_h(PrevH) of
+					not_found ->
+						{reply, {412, #{}, <<>>, Req}};
+					SearchSpaceUpperBound ->
+						validate_spora_pow(BShadow, PrevB, BDS, SearchSpaceUpperBound)
+				end;
 			false ->
 				case ar_mine:validate(BDS, Nonce, BShadow#block.diff, Height) of
 					{invalid, _} ->
@@ -1674,6 +1704,8 @@ post_block(check_pow, {BShadow, OrigPeer, BDS, PrevB}, Req, ReceiveTimestamp) ->
 				end
 		end,
 	case MaybeValid of
+		{reply, Reply} ->
+			Reply;
 		true ->
 			post_block(post_block, {BShadow, OrigPeer, BDS}, Req, ReceiveTimestamp);
 		false ->
@@ -1701,28 +1733,57 @@ compute_hash(B, Height) ->
 			{BDS, ar_weave:indep_hash(BDS, Hash, Nonce)}
 	end.
 
-validate_spora_pow(B, PrevB, BDS) ->
-	#block{
-		height = PrevHeight,
-		indep_hash = PrevH
-	} = PrevB,
-	#block{
-		height = Height,
-		nonce = Nonce,
-		timestamp = Timestamp,
-		poa = #poa{ chunk = Chunk }
-	} = B,
+validate_spora_pow(B, PrevB, BDS, SearchSpaceUpperBound) ->
+	#block{ height = PrevHeight, indep_hash = PrevH } = PrevB,
+	#block{ height = Height, nonce = Nonce, timestamp = Timestamp,
+			poa = #poa{ chunk = Chunk } = SPoA } = B,
 	Root = ar_block:compute_hash_list_merkle(PrevB),
 	case {Root, PrevHeight + 1} == {B#block.hash_list_merkle, Height} of
 		false ->
 			false;
 		true ->
-			H0 = ar_weave:hash(BDS, Nonce, Height),
-			SolutionHash =
-				ar_mine:spora_solution_hash(PrevH, Timestamp, H0, Chunk, Height),
-			ar_mine:validate(SolutionHash, B#block.diff, Height)
-				andalso SolutionHash == B#block.hash
+			{H0, Entropy} = ar_mine:spora_h0_with_entropy(BDS, Nonce, Height),
+			ComputeSolutionHash =
+				case ar_mine:pick_recall_byte(H0, PrevH, SearchSpaceUpperBound) of
+					{error, weave_size_too_small} ->
+						case SPoA == #poa{} of
+							false ->
+								false;
+							true ->
+								ar_mine:spora_solution_hash(PrevH, Timestamp, H0, Chunk, Height)
+						end;
+					{ok, RecallByte} ->
+						PackingThreshold = ar_block:get_packing_threshold(PrevB,
+								SearchSpaceUpperBound),
+						case verify_packing_threshold(B, PackingThreshold) of
+							false ->
+								false;
+							true ->
+								case RecallByte >= PackingThreshold of
+									true ->
+										ar_mine:spora_solution_hash_with_entropy(PrevH,
+												Timestamp, H0, Chunk, Entropy, Height);
+									false ->
+										ar_mine:spora_solution_hash(PrevH, Timestamp, H0, Chunk,
+												Height)
+								end
+						end
+				end,
+			case ComputeSolutionHash of
+				false ->
+					false;
+				SolutionHash ->
+					ar_mine:validate(SolutionHash, B#block.diff, Height)
+						andalso SolutionHash == B#block.hash
+			end
 	end.
+
+verify_packing_threshold(_B, undefined) ->
+	true;
+verify_packing_threshold(#block{ packing_2_5_threshold = PackingThreshold }, PackingThreshold) ->
+	true;
+verify_packing_threshold(_, _) ->
+	false.
 
 post_block_reject_warn(BShadow, Step, Peer) ->
 	?LOG_WARNING([
@@ -1845,9 +1906,13 @@ process_request(get_block, [Type, ID, Field], Req) ->
 						{'EXIT', _} ->
 							{404, #{}, <<"Not Found.">>, Req};
 						Atom ->
-							{_, Res} = lists:keyfind(Atom, 1, BLOCKJSON),
-							Result = block_field_to_string(Field, Res),
-							{200, #{}, Result, Req}
+							case lists:keyfind(Atom, 1, BLOCKJSON) of
+								{_, Res} ->
+									Result = block_field_to_string(Field, Res),
+									{200, #{}, Result, Req};
+								_ ->
+									{404, #{}, <<"Not Found.">>, Req}
+							end
 					end
 			end;
 		_ ->
@@ -1898,18 +1963,6 @@ wallet_list_chunk_to_json(#{ next_cursor := NextCursor, wallets := Wallets }) ->
 				next_cursor => ar_util:encode(Cursor),
 				wallets => SerializedWallets
 			})
-	end.
-
-validate_get_block_type_id(<<"height">>, ID) ->
-	try binary_to_integer(ID) of
-		Int -> {ok, Int}
-	catch _:_ ->
-		{error, {400, #{}, <<"Invalid height.">>}}
-	end;
-validate_get_block_type_id(<<"hash">>, ID) ->
-	case ar_util:safe_decode(ID) of
-		{ok, Hash} -> {ok, Hash};
-		{error, invalid} -> {error, {400, #{}, <<"Invalid hash.">>}}
 	end.
 
 %% @doc Take a block type specifier, an ID, and a BI, returning whether the

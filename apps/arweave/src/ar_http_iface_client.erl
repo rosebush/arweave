@@ -4,34 +4,16 @@
 
 -module(ar_http_iface_client).
 
--export([
-	send_new_block/3,
-	send_new_tx/2,
-	get_block/2,
-	get_block_shadow/2,
-	get_tx/3,
-	get_txs/3,
-	get_tx_from_remote_peer/2,
-	get_tx_data/2,
-	get_wallet_list_chunk/2,
-	get_wallet_list_chunk/3,
-	get_wallet_list/2,
-	add_peer/1,
-	get_info/1,
-	get_info/2,
-	get_peers/1,
-	get_time/2,
-	get_height/1,
-	get_block_index/1,
-	get_block_index/2,
-	get_sync_record/1, get_sync_record/3,
-	get_chunk/2,
-	get_mempool/1
-]).
+-export([send_new_block/3, send_new_tx/2, get_block/2, get_block_shadow/2, get_tx/3, get_txs/3,
+		get_tx_from_remote_peer/2, get_tx_data/2, get_wallet_list_chunk/2,
+		get_wallet_list_chunk/3, get_wallet_list/2, add_peer/1, get_info/1, get_info/2,
+		get_peers/1, get_time/2, get_height/1, get_block_index/1, get_block_index/2,
+		get_sync_record/1, get_sync_record/3, get_chunk/3, get_mempool/1, get_sync_buckets/1]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_config.hrl").
 -include_lib("arweave/include/ar_data_sync.hrl").
+-include_lib("arweave/include/ar_data_discovery.hrl").
 -include_lib("arweave/include/ar_wallets.hrl").
 
 %% @doc Send a new transaction to an Arweave HTTP node.
@@ -310,7 +292,7 @@ get_sync_record(Peer) ->
 		peer => Peer,
 		method => get,
 		path => "/data_sync_record",
-		timeout => 5 * 1000,
+		timeout => 15 * 1000,
 		connect_timeout => 500,
 		limit => ?MAX_ETF_SYNC_RECORD_SIZE,
 		headers => Headers
@@ -326,9 +308,22 @@ get_sync_record(Peer, Start, Limit) ->
 		connect_timeout => 500,
 		limit => ?MAX_ETF_SYNC_RECORD_SIZE,
 		headers => Headers
-	})).
+	}), Start, Limit).
 
-get_chunk(Peer, Offset) ->
+get_chunk(Peer, Offset, RequestedPacking) ->
+	Headers = [{<<"x-packing">>, atom_to_binary(RequestedPacking)},
+			%% The nodes not upgraded to the 2.5 version would ignore this header.
+			%% It is fine because all offsets before 2.5 are not bucket-based.
+			%% Client libraries do not send this header - normally they do not need
+			%% bucket-based offsets. Bucket-based offsets are required in mining
+			%% after the fork 2.5 and it is convenient to use them for syncing,
+			%% thus setting the header here. A bucket-based offset corresponds to
+			%% the chunk that ends in the same 256 KiB bucket starting from the
+			%% 2.5 block. In most cases a bucket-based offset would correspond to
+			%% the same chunk as the normal offset except for the offsets of the
+			%% last and second last chunks of the transactions when these chunks
+			%% are smaller than 256 KiB.
+			{<<"x-bucket-based-offset">>, <<"true">>}],
 	handle_chunk_response(ar_http:req(#{
 		peer => Peer,
 		method => get,
@@ -336,7 +331,7 @@ get_chunk(Peer, Offset) ->
 		timeout => 30 * 1000,
 		connect_timeout => 2000,
 		limit => ?MAX_SERIALIZED_CHUNK_PROOF_SIZE,
-		headers => p2p_headers()
+		headers => p2p_headers() ++ Headers
 	})).
 
 get_mempool(Peer) ->
@@ -352,9 +347,45 @@ get_mempool(Peer) ->
 		headers => p2p_headers()
 	})).
 
+get_sync_buckets(Peer) ->
+	handle_get_sync_buckets_response(ar_http:req(#{
+		peer => Peer,
+		method => get,
+		path => "/sync_buckets",
+		timeout => 5 * 1000,
+		connect_timeout => 500,
+		limit => ?MAX_SYNC_BUCKETS_SIZE,
+		headers => p2p_headers()
+	})).
+
 handle_sync_record_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 	ar_intervals:safe_from_etf(Body);
 handle_sync_record_response(Reply) ->
+	{error, Reply}.
+
+handle_sync_record_response({ok, {{<<"200">>, _}, _, Body, _, _}}, Start, Limit) ->
+	case ar_intervals:safe_from_etf(Body) of
+		{ok, Intervals} ->
+			case ar_intervals:count(Intervals) > Limit of
+				true ->
+					{error, too_many_intervals};
+				false ->
+					case ar_intervals:is_empty(Intervals) of
+						true ->
+							{ok, Intervals};
+						false ->
+							case element(1, ar_intervals:smallest(Intervals)) < Start of
+								true ->
+									{error, intervals_do_not_match_cursor};
+								false ->
+									{ok, Intervals}
+							end
+					end
+			end;
+		Error ->
+			Error
+	end;
+handle_sync_record_response(Reply, _, _) ->
 	{error, Reply}.
 
 handle_chunk_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
@@ -362,7 +393,14 @@ handle_chunk_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 		{'EXIT', Reason} ->
 			{error, Reason};
 		Proof ->
-			{ok, Proof}
+			case maps:get(chunk, Proof) of
+				<<>> ->
+					{error, empty_chunk};
+				Chunk when byte_size(Chunk) > ?DATA_CHUNK_SIZE ->
+					{error, chunk_bigger_than_256kib};
+				_ ->
+					{ok, Proof}
+			end
 	end;
 handle_chunk_response(Response) ->
 	{error, Response}.
@@ -402,6 +440,21 @@ handle_mempool_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 			{error, invalid_format}
 	end;
 handle_mempool_response(Response) ->
+	{error, Response}.
+
+handle_get_sync_buckets_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
+	case ar_sync_buckets:deserialize(Body) of
+		{ok, Buckets} ->
+			{ok, Buckets};
+		{'EXIT', Reason} ->
+			{error, Reason};
+		_ ->
+			{error, invalid_response_type}
+	end;
+handle_get_sync_buckets_response({ok, {{<<"400">>, _}, _,
+		<<"Request type not found.">>, _, _}}) ->
+	{error, request_type_not_found};
+handle_get_sync_buckets_response(Response) ->
 	{error, Response}.
 
 %% @doc Return the current height of a remote node.
@@ -688,8 +741,10 @@ reconstruct_full_block(Peers, B) when is_record(B, block) ->
 %% @doc Process the response of a /tx call.
 handle_tx_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 	case catch ar_serialize:json_struct_to_tx(Body) of
-		TX when is_record(TX, tx) -> TX;
-		_ -> not_found
+		TX when is_record(TX, tx) ->
+			case TX#tx.format == 1 of true -> TX; _ -> TX#tx{ data = <<>> } end;
+		_ ->
+			not_found
 	end;
 handle_tx_response({ok, {{<<"202">>, _}, _, _, _, _}}) -> pending;
 handle_tx_response({ok, {{<<"404">>, _}, _, _, _, _}}) -> not_found;

@@ -4,7 +4,7 @@
 	get_tx_fee/4,
 	get_miner_reward_and_endowment_pool/1,
 	get_tx_fee_pre_fork_2_4/4,
-	usd_to_ar/3,
+	usd_to_ar_rate/1, usd_to_ar/3,
 	recalculate_usd_to_ar_rate/1,
 	usd_to_ar_pre_fork_2_4/3,
 	get_miner_reward_and_endowment_pool_pre_fork_2_4/1
@@ -22,8 +22,8 @@
 %%%===================================================================
 
 -type nonegint() :: non_neg_integer().
--type decimal() :: {integer(), integer()}.
--type usd() :: float() | decimal().
+-type fraction() :: {integer(), integer()}.
+-type usd() :: float() | fraction().
 -type date() :: {nonegint(), nonegint(), nonegint()}.
 -type time() :: {nonegint(), nonegint(), nonegint()}.
 -type datetime() :: {date(), time()}.
@@ -112,6 +112,18 @@ get_miner_reward_and_endowment_pool_pre_fork_2_4(Args) ->
 			{BaseReward + Take, Pool2 - Take}
 	end.
 
+%% @doc Return the effective USD to AR rate corresponding to the given block
+%% considering its previous block.
+usd_to_ar_rate(#block{ height = PrevHeight } = PrevB) ->
+	Height_2_5 = ar_fork:height_2_5(),
+	Height = PrevHeight + 1,
+	case PrevHeight < Height_2_5 of
+		true ->
+			?INITIAL_USD_TO_AR(Height)();
+		false ->
+			PrevB#block.usd_to_ar_rate
+	end.
+
 %% @doc Return the amount of AR the given number of USD is worth.
 usd_to_ar(USD, Rate, Height) when is_number(USD) ->
 	usd_to_ar({USD, 1}, Rate, Height);
@@ -129,8 +141,9 @@ usd_to_ar({Dividend, Divisor}, Rate, Height) ->
 
 recalculate_usd_to_ar_rate(#block{ height = PrevHeight } = B) ->
 	Height = PrevHeight + 1,
-	true = Height >= ar_fork:height_2_5(),
-	case Height > ar_fork:height_2_6() of
+	Fork_2_5 = ar_fork:height_2_5(),
+	true = Height >= Fork_2_5,
+	case Height > Fork_2_5 of
 		false ->
 			Rate = ?INITIAL_USD_TO_AR(Height)(),
 			{Rate, Rate};
@@ -227,7 +240,7 @@ get_gb_cost_per_year_at_datetime({{Y, M, _}, _} = DT, Height) ->
 			{PrevYCostDividend, PrevYCostDivisor} = PrevYCost,
 			{NextYCostDividend, NextYCostDivisor} = NextYCost,
 			Dividend =
-				?N_REPLICATIONS
+				(?N_REPLICATIONS(Height))
 				* (
 					PrevYCostDividend * NextYCostDivisor * FracYDivisor
 					- FracYDividend
@@ -245,7 +258,7 @@ get_gb_cost_per_year_at_datetime({{Y, M, _}, _} = DT, Height) ->
 			{Dividend, Divisor};
 		false ->
 			CY = PrevYCost - (FracY * (PrevYCost - NextYCost)),
-			CY * ?N_REPLICATIONS
+			CY * (?N_REPLICATIONS(Height))
 	end.
 
 prev_jun_30_year(Y, M) when M < 7 ->
@@ -297,7 +310,7 @@ usd_p_gby(Y, Height) ->
 			{ADividend, ADivisor} = ?LN_USD_PER_GBY_DECAY_ANNUAL,
 			T = Y - 2019,
 			P = ?TX_PRICE_NATURAL_EXPONENT_DECIMAL_FRACTION_PRECISION,
-			{EDividend, EDivisor} = ar_decimal:natural_exponent({ADividend * T, ADivisor}, P),
+			{EDividend, EDivisor} = ar_fraction:natural_exponent({ADividend * T, ADivisor}, P),
 			{EDividend * KDividend, EDivisor * KDivisor};	
 		false ->
 			{Dividend, Divisor} = ?USD_PER_GBY_2019,
@@ -311,7 +324,7 @@ usd_p_gby(Y, Height) ->
 %% @doc Return elapsed time as the fraction of the year
 %% between Jun 30th of PrevY and Jun 30th of NextY.
 %% @end
--spec fraction_of_year(nonegint(), nonegint(), datetime(), nonegint()) -> float() | decimal().
+-spec fraction_of_year(nonegint(), nonegint(), datetime(), nonegint()) -> float() | fraction().
 fraction_of_year(PrevY, NextY, {{Y, Mo, D}, {H, Mi, S}}, Height) ->
 	Start = calendar:datetime_to_gregorian_seconds({{PrevY, 6, 30}, {23, 59, 59}}),
 	Now = calendar:datetime_to_gregorian_seconds({{Y, Mo, D}, {H, Mi, S}}),
@@ -348,7 +361,19 @@ recalculate_usd_to_ar_rate3(#block{ height = PrevHeight, diff = Diff } = B) ->
 	InitialRate = ?INITIAL_USD_TO_AR(Height)(),
 	{Dividend, Divisor} = InitialRate,
 	ScheduledRate = {Dividend * (MaxDiff - Diff), Divisor * (MaxDiff - InitialDiff)},
-	{B#block.scheduled_usd_to_ar_rate, ScheduledRate}.
+	Rate = B#block.scheduled_usd_to_ar_rate,
+	MaxAdjustmentUp = ar_fraction:multiply(Rate, ?USD_TO_AR_MAX_ADJUSTMENT_UP_MULTIPLIER),
+	MaxAdjustmentDown = ar_fraction:multiply(Rate, ?USD_TO_AR_MAX_ADJUSTMENT_DOWN_MULTIPLIER),
+	CappedScheduledRate = ar_fraction:reduce(ar_fraction:maximum(
+			ar_fraction:minimum(ScheduledRate, MaxAdjustmentUp), MaxAdjustmentDown),
+			?USD_TO_AR_FRACTION_REDUCTION_LIMIT),
+	?LOG_DEBUG([{event, recalculated_rate}, {new_rate, element(1, Rate) / element(2, Rate)},
+		{new_scheduled_rate, element(1, CappedScheduledRate) / element(2, CappedScheduledRate)},
+		{new_scheduled_rate_without_capping,
+			element(1, ScheduledRate) / element(2, ScheduledRate)},
+		{max_adjustment_up, element(1, MaxAdjustmentUp) / element(2,MaxAdjustmentUp)},
+		{max_adjustment_down, element(1, MaxAdjustmentDown) / element(2,MaxAdjustmentDown)}]),
+	{Rate, CappedScheduledRate}.
 
 %%%===================================================================
 %%% Tests.

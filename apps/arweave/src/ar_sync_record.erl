@@ -2,28 +2,28 @@
 
 -behaviour(gen_server).
 
--export([
-	start_link/0,
-	set/2, set/3,
-	add/3, add/4,
-	delete/3,
-	cut/2,
-	is_recorded/2, is_recorded/3,
-	get_record/2,
-	get_next_unsynced_interval/3,
-	get_interval/2
-]).
+-export([start_link/0, set/2, set/3, add/3, add/4, delete/3, cut/2, is_recorded/2, is_recorded/3,
+		get_record/2, get_serialized_sync_buckets/1, get_next_unsynced_interval/3,
+		get_next_synced_interval/4, get_interval/2]).
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_data_sync.hrl").
+-include_lib("arweave/include/ar_data_discovery.hrl").
 
 %% The kv storage key to the sync records.
 -define(SYNC_RECORDS_KEY, <<"sync_records">>).
 
 %% The kv key of the write ahead log counter.
 -define(WAL_COUNT_KEY, <<"wal">>).
+
+%% The frequency in seconds of updating serialized sync buckets.
+-ifdef(DEBUG).
+-define(UPDATE_SERIALIZED_SYNC_BUCKETS_FREQUENCY_S, 2).
+-else.
+-define(UPDATE_SERIALIZED_SYNC_BUCKETS_FREQUENCY_S, 300).
+-endif.
 
 %% The frequency of dumping sync records on disk.
 -ifdef(DEBUG).
@@ -46,6 +46,8 @@
 	sync_record_by_id,
 	%% A map {ID, Type} => Intervals.
 	sync_record_by_id_type,
+	%% Compact representations of synced intervals.
+	sync_buckets_by_id,
 	%% A reference to the on-disk key-value storage holding sync records
 	%% and a write ahead log.
 	state_db,
@@ -64,39 +66,69 @@ start_link() ->
 %% with the given ID. Store the changes on disk before
 %% returning ok.
 set(SyncRecord, ID) ->
-	gen_server:call(?MODULE, {set, SyncRecord, ID}, infinity).
+	case catch gen_server:call(?MODULE, {set, SyncRecord, ID}, infinity) of
+		{'EXIT', {timeout, {gen_server, call, _}}} ->
+			{error, timeout};
+		Reply ->
+			Reply
+	end.
 
 %% @doc Add the given set of intervals to the record
 %% with the given Type and ID. Store the changes on disk
 %% before, returning ok.
 set(SyncRecord, Type, ID) ->
-	gen_server:call(?MODULE, {set, SyncRecord, Type, ID}, infinity).
+	case catch gen_server:call(?MODULE, {set, SyncRecord, Type, ID}, infinity) of
+		{'EXIT', {timeout, {gen_server, call, _}}} ->
+			{error, timeout};
+		Reply ->
+			Reply
+	end.
 
 %% @doc Add the given interval to the record with the
 %% given ID. Store the changes on disk before returning ok.
 add(End, Start, ID) ->
-	gen_server:call(?MODULE, {add, End, Start, ID}, 10000).
+	case catch gen_server:call(?MODULE, {add, End, Start, ID}, 10000) of
+		{'EXIT', {timeout, {gen_server, call, _}}} ->
+			{error, timeout};
+		Reply ->
+			Reply
+	end.
 
 %% @doc Add the given interval to the record with the
 %% given ID and Type. Store the changes on disk before
 %% returning ok.
 add(End, Start, Type, ID) ->
-	gen_server:call(?MODULE, {add, End, Start, Type, ID}, 10000).
+	case catch gen_server:call(?MODULE, {add, End, Start, Type, ID}, 10000) of
+		{'EXIT', {timeout, {gen_server, call, _}}} ->
+			{error, timeout};
+		Reply ->
+			Reply
+	end.
 
 %% @doc Remove the given interval from the record
 %% with the given ID. Store the changes on disk before
 %% returning ok.
 delete(End, Start, ID) ->
-	gen_server:call(?MODULE, {delete, End, Start, ID}, 10000).
+	case catch gen_server:call(?MODULE, {delete, End, Start, ID}, 10000) of
+		{'EXIT', {timeout, {gen_server, call, _}}} ->
+			{error, timeout};
+		Reply ->
+			Reply
+	end.
 
 %% @doc Remove everything strictly above the given
 %% Offset from the record. Store the changes on disk
 %% before returning ok.
 cut(Offset, ID) ->
-	gen_server:call(?MODULE, {cut, Offset, ID}, 10000).
+	case catch gen_server:call(?MODULE, {cut, Offset, ID}, 10000) of
+		{'EXIT', {timeout, {gen_server, call, _}}} ->
+			{error, timeout};
+		Reply ->
+			Reply
+	end.
 
 %% @doc Return true or {true, Type} if a chunk containing
-% the given Offset is found in the record with the given ID,
+%% the given Offset is found in the record with the given ID,
 %% false otherwise. If several types are recorded for the chunk,
 %% only one of them is returned, the choice is not defined.
 %% The offset is 1-based - if a chunk consists of a single
@@ -146,11 +178,33 @@ get_record(Args, ID) ->
 			Reply
 	end.
 
+%% @doc Return an ETF-serialized compact but imprecise representation of the synced data -
+%% a bucket size and a map where every key is the sequence number of the bucket, every value -
+%% the percentage of data synced in the reported bucket.
+get_serialized_sync_buckets(ID) ->
+	case ets:lookup(?MODULE, {serialized_sync_buckets, ID}) of
+		[] ->
+			{error, not_initialized};
+		[{_, SerializedSyncBuckets}] ->
+			{ok, SerializedSyncBuckets}
+	end.
+
 %% @doc Return the lowest unsynced interval strictly above the given Offset
 %% and with the right bound at most RightBound.
 %% Return not_found if there are no such intervals.
 get_next_unsynced_interval(Offset, RightBound, ID) ->
 	ar_ets_intervals:get_next_interval_outside(ID, Offset, RightBound).
+
+%% @doc Return the lowest synced interval with the end offset strictly above the given Offset
+%% and with the right bound at most RightBound.
+%% Return not_found if there are no such intervals.
+get_next_synced_interval(Offset, RightBound, Type, ID) ->
+	case ets:lookup(sync_records, {ID, Type}) of
+		[] ->
+			not_found;
+		[{_, TID}] ->
+			ar_ets_intervals:get_next_interval(TID, Offset, RightBound)
+	end.
 
 %% @doc Return the interval containing the given Offset, including the right bound,
 %% excluding the left bound. Return not_found if the given offset does not belong to
@@ -166,101 +220,115 @@ init([]) ->
 	process_flag(trap_exit, true),
 	{ok, StateDB} = ar_kv:open_without_column_families("ar_sync_record_db", []),
 	{SyncRecordByID, SyncRecordByIDType, WAL} = read_sync_records(StateDB),
-	maps:map(
+	SyncBucketsByID = maps:map(
 		fun(ID, SyncRecord) ->
-			ar_ets_intervals:init_from_gb_set(ID, SyncRecord)
+			ar_ets_intervals:init_from_gb_set(ID, SyncRecord),
+			SyncBuckets = ar_sync_buckets:from_intervals(SyncRecord),
+			{SyncBuckets2, SerializedSyncBuckets} = ar_sync_buckets:serialize(SyncBuckets,
+					?MAX_SYNC_BUCKETS_SIZE),
+			ets:insert(?MODULE, {{serialized_sync_buckets, ID}, SerializedSyncBuckets}),
+			SyncBuckets2
 		end,
 		SyncRecordByID
 	),
 	initialize_sync_record_by_id_type_ets(SyncRecordByIDType),
+	gen_server:cast(?MODULE, {update_sync_buckets, []}),
 	gen_server:cast(?MODULE, store_state),
 	{ok, #state{
 		state_db = StateDB,
 		sync_record_by_id = SyncRecordByID,
 		sync_record_by_id_type = SyncRecordByIDType,
+		sync_buckets_by_id = SyncBucketsByID,
 		wal = WAL
 	}}.
 
 handle_call({set, SyncRecord, ID}, _From, State) ->
-	#state{
-		sync_record_by_id = SyncRecordByID
-	} = State,
+	#state{ sync_record_by_id = SyncRecordByID,
+			sync_buckets_by_id = SyncBucketsByID } = State,
 	SyncRecord2 = maps:get(ID, SyncRecordByID, ar_intervals:new()),
 	SyncRecord3 = ar_intervals:union(SyncRecord2, SyncRecord),
+	SyncBuckets = ar_sync_buckets:from_intervals(SyncRecord3),
+	{SyncBuckets2, SerializedSyncBuckets} = ar_sync_buckets:serialize(SyncBuckets,
+			?MAX_SYNC_BUCKETS_SIZE),
+	ets:insert(?MODULE, {{serialized_sync_buckets, ID}, SerializedSyncBuckets}),
 	SyncRecordByID2 = maps:put(ID, SyncRecord3, SyncRecordByID),
+	SyncBucketsByID2 = maps:put(ID, SyncBuckets2, SyncBucketsByID),
 	ar_ets_intervals:init_from_gb_set(ID, SyncRecord3),
-	State2 = State#state{ sync_record_by_id = SyncRecordByID2 },
+	State2 = State#state{ sync_record_by_id = SyncRecordByID2,
+			sync_buckets_by_id = SyncBucketsByID2 },
 	{Reply, State3} = store_state(State2),
 	{reply, Reply, State3};
 
 handle_call({set, SyncRecord, Type, ID}, _From, State) ->
-	#state{
-		sync_record_by_id = SyncRecordByID,
-		sync_record_by_id_type = SyncRecordByIDType
-	} = State,
+	#state{ sync_record_by_id = SyncRecordByID,
+			sync_record_by_id_type = SyncRecordByIDType,
+			sync_buckets_by_id = SyncBucketsByID } = State,
 	SyncRecord2 = maps:get(ID, SyncRecordByID, ar_intervals:new()),
 	SyncRecord3 = ar_intervals:union(SyncRecord2, SyncRecord),
+	SyncBuckets = ar_sync_buckets:from_intervals(SyncRecord3),
+	{SyncBuckets2, SerializedSyncBuckets} = ar_sync_buckets:serialize(SyncBuckets,
+			?MAX_SYNC_BUCKETS_SIZE),
+	ets:insert(?MODULE, {{serialized_sync_buckets, ID}, SerializedSyncBuckets}),
 	SyncRecordByID2 = maps:put(ID, SyncRecord3, SyncRecordByID),
+	SyncBucketsByID2 = maps:put(ID, SyncBuckets2, SyncBucketsByID),
 	ar_ets_intervals:init_from_gb_set(ID, SyncRecord3),
 	ByType = maps:get({ID, Type}, SyncRecordByIDType, ar_intervals:new()),
 	ByType2 = ar_intervals:union(ByType, SyncRecord),
 	SyncRecordByIDType2 = maps:put({ID, Type}, ByType2, SyncRecordByIDType),
 	TID = get_or_create_type_tid({ID, Type}),
 	ar_ets_intervals:init_from_gb_set(TID, ByType2),
-	State2 =
-		State#state{
-			sync_record_by_id = SyncRecordByID2,
-			sync_record_by_id_type = SyncRecordByIDType2
-		},
+	State2 = State#state{ sync_record_by_id = SyncRecordByID2,
+			sync_record_by_id_type = SyncRecordByIDType2,
+			sync_buckets_by_id = SyncBucketsByID2 },
 	{Reply, State3} = store_state(State2),
 	{reply, Reply, State3};
 
 handle_call({add, End, Start, ID}, _From, State) ->
-	#state{
-		sync_record_by_id = SyncRecordByID,
-		state_db = StateDB
-	} = State,
+	#state{ sync_record_by_id = SyncRecordByID, state_db = StateDB,
+			sync_buckets_by_id = SyncBucketsByID } = State,
 	SyncRecord = maps:get(ID, SyncRecordByID, ar_intervals:new()),
+	SyncBuckets = maps:get(ID, SyncBucketsByID, ar_sync_buckets:new()),
 	SyncRecord2 = ar_intervals:add(SyncRecord, End, Start),
 	SyncRecordByID2 = maps:put(ID, SyncRecord2, SyncRecordByID),
+	SyncBuckets2 = ar_sync_buckets:add(End, Start, SyncBuckets),
+	SyncBucketsByID2 = maps:put(ID, SyncBuckets2, SyncBucketsByID),
 	ar_ets_intervals:add(ID, End, Start),
-	State2 = State#state{ sync_record_by_id = SyncRecordByID2 },
+	State2 = State#state{ sync_record_by_id = SyncRecordByID2,
+			sync_buckets_by_id = SyncBucketsByID2 },
 	{Reply, State3} = update_write_ahead_log({add, {End, Start, ID}}, StateDB, State2),
 	{reply, Reply, State3};
 
 handle_call({add, End, Start, Type, ID}, _From, State) ->
-	#state{
-		sync_record_by_id = SyncRecordByID,
-		sync_record_by_id_type = SyncRecordByIDType,
-		state_db = StateDB
-	} = State,
+	#state{ sync_record_by_id = SyncRecordByID, sync_record_by_id_type = SyncRecordByIDType,
+			sync_buckets_by_id = SyncBucketsByID, state_db = StateDB } = State,
 	SyncRecord = maps:get(ID, SyncRecordByID, ar_intervals:new()),
 	SyncRecord2 = ar_intervals:add(SyncRecord, End, Start),
 	SyncRecordByID2 = maps:put(ID, SyncRecord2, SyncRecordByID),
 	ar_ets_intervals:add(ID, End, Start),
+	SyncBuckets = maps:get(ID, SyncBucketsByID, ar_sync_buckets:new()),
+	SyncBuckets2 = ar_sync_buckets:add(End, Start, SyncBuckets),
+	SyncBucketsByID2 = maps:put(ID, SyncBuckets2, SyncBucketsByID),
 	ByType = maps:get({ID, Type}, SyncRecordByIDType, ar_intervals:new()),
 	ByType2 = ar_intervals:add(ByType, End, Start),
 	SyncRecordByIDType2 = maps:put({ID, Type}, ByType2, SyncRecordByIDType),
 	TID = get_or_create_type_tid({ID, Type}),
 	ar_ets_intervals:add(TID, End, Start),
-	State2 =
-		State#state{
-			sync_record_by_id = SyncRecordByID2,
-			sync_record_by_id_type = SyncRecordByIDType2
-		},
+	State2 = State#state{ sync_record_by_id = SyncRecordByID2,
+			sync_record_by_id_type = SyncRecordByIDType2,
+			sync_buckets_by_id = SyncBucketsByID2 },
 	{Reply, State3} = update_write_ahead_log({{add, Type}, {End, Start, ID}}, StateDB, State2),
 	{reply, Reply, State3};
 
 handle_call({delete, End, Start, ID}, _From, State) ->
-	#state{
-		sync_record_by_id = SyncRecordByID,
-		sync_record_by_id_type = SyncRecordByIDType,
-		state_db = StateDB
-	} = State,
+	#state{ sync_record_by_id = SyncRecordByID, sync_record_by_id_type = SyncRecordByIDType,
+			sync_buckets_by_id = SyncBucketsByID, state_db = StateDB } = State,
 	SyncRecord = maps:get(ID, SyncRecordByID, ar_intervals:new()),
 	SyncRecord2 = ar_intervals:delete(SyncRecord, End, Start),
 	SyncRecordByID2 = maps:put(ID, SyncRecord2, SyncRecordByID),
 	ar_ets_intervals:delete(ID, End, Start),
+	SyncBuckets = maps:get(ID, SyncBucketsByID, ar_sync_buckets:new()),
+	SyncBuckets2 = ar_sync_buckets:delete(End, Start, SyncBuckets),
+	SyncBucketsByID2 = maps:put(ID, SyncBuckets2, SyncBucketsByID),
 	SyncRecordByIDType2 =
 		maps:map(
 			fun
@@ -281,24 +349,22 @@ handle_call({delete, End, Start, ID}, _From, State) ->
 		ok,
 		sync_records
 	),
-	State2 =
-		State#state{
-			sync_record_by_id = SyncRecordByID2,
-			sync_record_by_id_type = SyncRecordByIDType2
-		},
+	State2 = State#state{ sync_record_by_id = SyncRecordByID2,
+			sync_record_by_id_type = SyncRecordByIDType2,
+			sync_buckets_by_id = SyncBucketsByID2 },
 	{Reply, State3} = update_write_ahead_log({delete, {End, Start, ID}}, StateDB, State2),
 	{reply, Reply, State3};
 
 handle_call({cut, Offset, ID}, _From, State) ->
-	#state{
-		sync_record_by_id = SyncRecordByID,
-		sync_record_by_id_type = SyncRecordByIDType,
-		state_db = StateDB
-	} = State,
+	#state{ sync_record_by_id = SyncRecordByID, sync_record_by_id_type = SyncRecordByIDType,
+			sync_buckets_by_id = SyncBucketsByID, state_db = StateDB } = State,
 	SyncRecord = maps:get(ID, SyncRecordByID, ar_intervals:new()),
 	SyncRecord2 = ar_intervals:cut(SyncRecord, Offset),
 	SyncRecordByID2 = maps:put(ID, SyncRecord2, SyncRecordByID),
 	ar_ets_intervals:cut(ID, Offset),
+	SyncBuckets = maps:get(ID, SyncBucketsByID, ar_sync_buckets:new()),
+	SyncBuckets2 = ar_sync_buckets:cut(Offset, SyncBuckets),
+	SyncBucketsByID2 = maps:put(ID, SyncBuckets2, SyncBucketsByID),
 	SyncRecordByIDType2 =
 		maps:map(
 			fun
@@ -319,18 +385,14 @@ handle_call({cut, Offset, ID}, _From, State) ->
 		ok,
 		sync_records
 	),
-	State2 =
-		State#state{
-			sync_record_by_id = SyncRecordByID2,
-			sync_record_by_id_type = SyncRecordByIDType2
-		},
+	State2 = State#state{ sync_record_by_id = SyncRecordByID2,
+			sync_record_by_id_type = SyncRecordByIDType2,
+			sync_buckets_by_id = SyncBucketsByID2 },
 	{Reply, State3} = update_write_ahead_log({cut, {Offset, ID}}, StateDB, State2),
 	{reply, Reply, State3};
 
 handle_call({get_record, Args, ID}, _From, State) ->
-	#state{
-		sync_record_by_id = SyncRecordByID
-	} = State,
+	#state{ sync_record_by_id = SyncRecordByID } = State,
 	Limit =
 		min(
 			maps:get(limit, Args, ?MAX_SHARED_SYNCED_INTERVALS_COUNT),
@@ -342,6 +404,25 @@ handle_call({get_record, Args, ID}, _From, State) ->
 handle_call(Request, _From, State) ->
 	?LOG_WARNING("event: unhandled_call, request: ~p", [Request]),
 	{reply, ok, State}.
+
+handle_cast(update_sync_buckets, State) ->
+	#state{ sync_buckets_by_id = SyncBucketsByID } = State,
+	Keys = maps:keys(SyncBucketsByID),
+	gen_server:cast(?MODULE, {update_sync_buckets, Keys}),
+	{noreply, State};
+
+handle_cast({update_sync_buckets, []}, State) ->
+	ar_util:cast_after(?UPDATE_SERIALIZED_SYNC_BUCKETS_FREQUENCY_S, ?MODULE,
+			update_sync_buckets),
+	{noreply, State};
+handle_cast({update_sync_buckets, [ID | Keys]}, State) ->
+	#state{ sync_buckets_by_id = SyncBucketsByID } = State,
+	SyncBuckets = maps:get(ID, SyncBucketsByID, ar_sync_buckets:new()),
+	{SyncBuckets2, SerializedSyncBuckets} = ar_sync_buckets:serialize(SyncBuckets,
+			?MAX_SYNC_BUCKETS_SIZE),
+	ets:insert(?MODULE, [{{serialized_sync_buckets, ID}, SerializedSyncBuckets}]),
+	gen_server:cast(?MODULE, {update_sync_buckets, Keys}),
+	{noreply, State#state{ sync_buckets_by_id = maps:put(ID, SyncBuckets2, SyncBucketsByID) }};
 
 handle_cast(store_state, State) ->
 	{_, State2} = store_state(State),
@@ -514,6 +595,15 @@ store_state(State) ->
 		ok ->
 			SyncRecord = maps:get(ar_data_sync, SyncRecordByID, ar_intervals:new()),
 			prometheus_gauge:set(v2_index_data_size, ar_intervals:sum(SyncRecord)),
+			maps:map(
+				fun	({ar_data_sync, Type}, TypeRecord) ->
+						prometheus_gauge:set(v2_index_data_size_by_packing, [Type],
+								ar_intervals:sum(TypeRecord));
+					(_, _) ->
+						ok
+				end,
+				SyncRecordByIDType
+			),
 			{ok, State#state{ wal = 0 }}
 	end.
 

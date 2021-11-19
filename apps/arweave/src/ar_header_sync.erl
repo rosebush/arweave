@@ -2,12 +2,7 @@
 
 -behaviour(gen_server).
 
--export([
-	start_link/0,
-	join/2,
-	add_tip_block/2, add_block/1,
-	request_tx_removal/1
-]).
+-export([start_link/0, join/2, add_tip_block/2, add_block/1, request_tx_removal/1]).
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
@@ -51,6 +46,7 @@ request_tx_removal(TXID) ->
 init([]) ->
 	?LOG_INFO([{event, ar_header_sync_start}]),
 	process_flag(trap_exit, true),
+	ok = ar_events:subscribe(tx),
 	{ok, Config} = application:get_env(arweave, config),
 	{ok, DB} = ar_kv:open("ar_header_sync_db"),
 	{SyncRecord, LastHeight, CurrentBI} =
@@ -142,7 +138,8 @@ handle_cast({add_tip_block, #block{ height = Height } = B, RecentBI}, State) ->
 			%% Delete from the kv store only after the sync record is saved - no matter
 			%% what happens to the process, if a height is in the record, it must be present
 			%% in the kv store.
-			ok = ar_kv:delete_range(DB, << (BaseHeight + 1):256 >>, << (CurrentHeight + 1):256 >>),
+			ok = ar_kv:delete_range(DB, << (BaseHeight + 1):256 >>,
+					<< (CurrentHeight + 1):256 >>),
 			{noreply, State3#{ disk_full => false }};
 		{error, enospc} ->
 			{noreply, State#{ disk_full => true }}
@@ -172,11 +169,11 @@ handle_cast(check_space_alarm, State) ->
 		true ->
 			ok
 	end,
-	cast_after(?DISK_SPACE_WARNING_FREQUENCY, check_space_alarm),
+	ar_util:cast_after(?DISK_SPACE_WARNING_FREQUENCY, ?MODULE, check_space_alarm),
 	{noreply, State};
 
 handle_cast(check_space, State) ->
-	cast_after(ar_disksup:get_disk_space_check_frequency(), check_space),
+	ar_util:cast_after(ar_disksup:get_disk_space_check_frequency(), ?MODULE, check_space),
 	case have_free_space() of
 		true ->
 			{noreply, State#{ sync_disk_space => true }};
@@ -185,7 +182,7 @@ handle_cast(check_space, State) ->
 	end;
 
 handle_cast(process_item, #{ sync_disk_space := false } = State) ->
-	cast_after(?CHECK_AFTER_SYNCED_INTERVAL_MS, process_item),
+	ar_util:cast_after(?CHECK_AFTER_SYNCED_INTERVAL_MS, ?MODULE, process_item),
 	{noreply, State};
 handle_cast(process_item, State) ->
 	#{
@@ -237,12 +234,12 @@ handle_cast({failed_to_get_block, H, H2, TXRoot, Backoff}, #{ queue := Queue } =
 	{noreply, State#{ queue => Queue2 }};
 
 handle_cast({remove_tx, TXID}, State) ->
-	{ok, _Size} = ar_storage:delete_tx(TXID),
+	{ok, _Size} = ar_storage:delete_blacklisted_tx(TXID),
 	ar_tx_blacklist:notify_about_removed_tx(TXID),
 	{noreply, State};
 
 handle_cast(store_sync_state, State) ->
-	cast_after(?STORE_HEADER_STATE_FREQUENCY_MS, store_sync_state),
+	ar_util:cast_after(?STORE_HEADER_STATE_FREQUENCY_MS, ?MODULE, store_sync_state),
 	case store_sync_state(State) of
 		ok ->
 			{noreply, State#{ disk_full => false }};
@@ -256,6 +253,30 @@ handle_cast(Msg, State) ->
 
 handle_call(_Msg, _From, State) ->
 	{reply, not_implemented, State}.
+
+handle_info({event, tx, {preparing_unblacklisting, TXID}}, State) ->
+	#{ db := DB, sync_record := SyncRecord } = State,
+	case ar_storage:get_tx_confirmation_data(TXID) of
+		{ok, {Height, _BH}} ->
+			?LOG_DEBUG([{event, mark_block_with_blacklisted_tx_for_resyncing},
+					{tx, ar_util:encode(TXID)}, {height, Height}]),
+			State2 = State#{ sync_record => ar_intervals:delete(SyncRecord, Height,
+					Height - 1) },
+			ok = store_sync_state(State2),
+			ok = ar_kv:delete(DB, << Height:256 >>),
+			ar_events:send(tx, {ready_for_unblacklisting, TXID}),
+			{noreply, State2};
+		not_found ->
+			ar_events:send(tx, {ready_for_unblacklisting, TXID}),
+			{noreply, State};
+		{error, Reason} ->
+			?LOG_WARNING([{event, failed_to_read_tx_confirmation_index},
+					{error, io_lib:format("~p", [Reason])}]),
+			{noreply, State}
+	end;
+
+handle_info({event, tx, _}, State) ->
+	{noreply, State};
 
 handle_info({'DOWN', _,  process, _, normal}, State) ->
 	{noreply, State};
@@ -317,8 +338,7 @@ add_block(B, #{ sync_disk_space := false } = State) ->
 add_block(B, State) ->
 	#{ db := DB, sync_record := SyncRecord } = State,
 	#block{ indep_hash = H, previous_block = PrevH, height = Height } = B,
-	TXs = [TX || TX <- B#block.txs, not ar_tx_blacklist:is_tx_blacklisted(TX#tx.id)],
-	case ar_storage:write_full_block(B, TXs) of
+	case ar_storage:write_full_block(B, B#block.txs) of
 		ok ->
 			case ar_intervals:is_inside(SyncRecord, Height) of
 				true ->
@@ -343,11 +363,6 @@ have_free_space() ->
 		%% RocksDB and the chunk storage contain v1 data, which is part of the headers.
 		andalso ar_storage:get_free_space(?ROCKS_DB_DIR) > ?DISK_HEADERS_BUFFER_SIZE
 			andalso (ar_storage:get_free_space(?CHUNK_DIR) > ?DISK_HEADERS_BUFFER_SIZE orelse ar_multi_dir:have_valid_free_space()).
-
-cast_after(Delay, Message) ->
-	%% Not using timer:apply_after here because send_after is more efficient:
-	%% http://erlang.org/doc/efficiency_guide/commoncaveats.html#timer-module.
-	erlang:send_after(Delay, ?MODULE, {'$gen_cast', Message}).
 
 %% @doc Pick the biggest height smaller than LastPicked from outside the sync record.
 pick_unsynced_block(LastPicked, SyncRecord) ->
@@ -382,11 +397,11 @@ process_item(Queue) ->
 	Now = os:system_time(second),
 	case queue:out(Queue) of
 		{empty, _Queue} ->
-			cast_after(?PROCESS_ITEM_INTERVAL_MS, process_item),
+			ar_util:cast_after(?PROCESS_ITEM_INTERVAL_MS, ?MODULE, process_item),
 			Queue;
 		{{value, {Item, {BackoffTimestamp, _} = Backoff}}, UpdatedQueue}
 				when BackoffTimestamp > Now ->
-			cast_after(?PROCESS_ITEM_INTERVAL_MS, process_item),
+			ar_util:cast_after(?PROCESS_ITEM_INTERVAL_MS, ?MODULE, process_item),
 			enqueue(Item, Backoff, UpdatedQueue);
 		{{value, {{block, {H, H2, TXRoot}}, Backoff}}, UpdatedQueue} ->
 			monitor(process, spawn(
@@ -396,7 +411,7 @@ process_item(Queue) ->
 							gen_server:cast(?MODULE, {failed_to_get_block, H, H2, TXRoot, Backoff});
 						{ok, B} ->
 							gen_server:cast(?MODULE, {add_historical_block, B}),
-							cast_after(?PROCESS_ITEM_INTERVAL_MS, process_item)
+							ar_util:cast_after(?PROCESS_ITEM_INTERVAL_MS, ?MODULE, process_item)
 					end
 				end
 			)),
@@ -456,7 +471,7 @@ download_block(Peers, H, H2, TXRoot) ->
 download_txs(Peers, B, TXRoot) ->
 	case ar_http_iface_client:get_txs(Peers, #{}, B) of
 		{ok, TXs} ->
-			SizeTaggedTXs = ar_block:generate_size_tagged_list_from_txs(TXs),
+			SizeTaggedTXs = ar_block:generate_size_tagged_list_from_txs(TXs, B#block.height),
 			SizeTaggedDataRoots =
 				[{Root, Offset} || {{_, Root}, Offset} <- SizeTaggedTXs],
 			{Root, _Tree} = ar_merkle:generate_tree(SizeTaggedDataRoots),

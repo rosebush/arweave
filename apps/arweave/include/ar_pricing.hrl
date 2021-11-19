@@ -4,8 +4,18 @@
 %% The amount in AR depends on the current difficulty and height.
 -define(WALLET_GEN_FEE_USD, {1, 10}).
 
-%% Assumed number of replications in the long term.
--define(N_REPLICATIONS, 10).
+%% The target number of replications.
+-define(N_REPLICATIONS, fun(MACRO_Height) ->
+	MACRO_Forks = {
+		ar_fork:height_2_5()
+	},
+	case MACRO_Forks of
+		{MACRO_Fork_2_5} when MACRO_Height >= MACRO_Fork_2_5 ->
+			45;
+		_ ->
+			10
+	end
+end).
 
 %% An approximation of the natural logarithm of ?USD_PER_GBY_DECAY_ANNUAL (0.995),
 %% expressed as a decimal fraction, with the precision of math:log.
@@ -32,13 +42,20 @@
 %% rewards.
 -define(INITIAL_USD_TO_AR(Height), fun() ->
 	Forks = {
+		ar_fork:height_2_4(),
 		ar_fork:height_2_5()
 	},
 	case Forks of
-		{Fork_2_5} when Height >= Fork_2_5 ->
-			{1, 20}
+		{_Fork_2_4, Fork_2_5} when Height >= Fork_2_5 ->
+			{1, 65};
+		{Fork_2_4, _Fork_2_5} when Height >= Fork_2_4 ->
+			?INITIAL_USD_TO_AR_PRE_FORK_2_5
 	end
 end).
+
+%% The original USD to AR conversion rate, defined as a fraction. Set up at fork 2.4.
+%% Used until the fork 2.5.
+-define(INITIAL_USD_TO_AR_PRE_FORK_2_5, {1, 5}).
 
 %% The network difficulty at the time when the USD to AR exchange rate was
 %% ?INITIAL_USD_TO_AR(Height). Used to account for the change in the network
@@ -47,14 +64,14 @@ end).
 	Forks = {
 		ar_fork:height_1_9(),
 		ar_fork:height_2_2(),
-		ar_fork:height_2_6()
+		ar_fork:height_2_5()
 	},
 	case Forks of
-		{_Fork_1_9, _Fork_2_2, Fork_2_6} when Height >= Fork_2_6 ->
-			not_set;
-		{_Fork_1_9, Fork_2_2, _Fork_2_6} when Height >= Fork_2_2 ->
+		{_Fork_1_9, _Fork_2_2, Fork_2_5} when Height >= Fork_2_5 ->
+			32;
+		{_Fork_1_9, Fork_2_2, _Fork_2_5} when Height >= Fork_2_2 ->
 			34;
-		{Fork_1_9, _Fork_2_2, _Fork_2_6} when Height < Fork_1_9 ->
+		{Fork_1_9, _Fork_2_2, _Fork_2_5} when Height < Fork_1_9 ->
 			28;
 		_ ->
 			29
@@ -83,22 +100,31 @@ end).
 end).
 
 %% The USD to AR rate is re-estimated every so many blocks.
+-ifdef(DEBUG).
+-define(USD_TO_AR_ADJUSTMENT_FREQUENCY, 10).
+-else.
 -define(USD_TO_AR_ADJUSTMENT_FREQUENCY, 50).
+-endif.
+
+%% The largest possible multiplier for a one-step increase of the USD to AR Rate.
+-define(USD_TO_AR_MAX_ADJUSTMENT_UP_MULTIPLIER, {1005, 1000}).
+
+%% The largest possible multiplier for a one-step decrease of the USD to AR Rate.
+-define(USD_TO_AR_MAX_ADJUSTMENT_DOWN_MULTIPLIER, {995, 1000}).
+
+%% Reduce the USD to AR fraction if both the dividend and the devisor become bigger than this.
+-ifdef(DEBUG).
+-define(USD_TO_AR_FRACTION_REDUCTION_LIMIT, 100).
+-else.
+-define(USD_TO_AR_FRACTION_REDUCTION_LIMIT, 1000000).
+-endif.
 
 %% Mining reward as a proportion of the estimated transaction storage costs,
 %% defined as a fraction.
 -define(MINING_REWARD_MULTIPLIER, {2, 10}).
 
 %% The USD to AR exchange rate for a new chain, e.g. a testnet.
--define(NEW_WEAVE_USD_TO_AR_RATE, {1, 4}).
-
-%% The original USD to AR conversion rate, defined as a fraction. Set up at fork 2.4.
-%% Used until the fork 2.5.
--define(USD_TO_AR_INITIAL_RATE, {1, 5}).
-
-%% How much harder it should be to mine each
-%% subsequent alternative POA option. Used until the fork 2.4.
--define(ALTERNATIVE_POA_DIFF_MULTIPLIER, 2).
+-define(NEW_WEAVE_USD_TO_AR_RATE, ?INITIAL_USD_TO_AR_PRE_FORK_2_5).
 
 %% Initial $/AR exchange rate. Used until the fork 2.4.
 -define(INITIAL_USD_PER_AR(Height), fun() ->

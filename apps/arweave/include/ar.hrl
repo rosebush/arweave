@@ -184,11 +184,11 @@
 -define(MAX_TX_ANCHOR_DEPTH, ?STORE_BLOCKS_BEHIND_CURRENT).
 
 %% Default timeout for establishing an HTTP connection.
--define(HTTP_REQUEST_CONNECT_TIMEOUT, 10 * 1000).
+-define(HTTP_REQUEST_CONNECT_TIMEOUT, 60 * 1000).
 
 %% Default timeout used when sending to and receiving from a TCP socket
 %% when making an HTTP request.
--define(HTTP_REQUEST_SEND_TIMEOUT, 60 * 1000).
+-define(HTTP_REQUEST_SEND_TIMEOUT, 120 * 1000).
 
 %% The time in milliseconds to wait before retrying
 %% a failed join (block index download) attempt.

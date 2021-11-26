@@ -340,6 +340,10 @@ read_chunk(Byte, Start, Key, Filename) ->
 			not_found;
 		{ok, File} ->
 			Result = read_chunk2(Byte, Start, Key, File),
+			case Result of 
+				not_found ->
+					?LOG_WARNING([{event, read_chunk2_failed},{filepath,   Filepath}])	
+			end,
 			file:close(File),
 			Result
 	end.

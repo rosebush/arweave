@@ -65,6 +65,8 @@ open_files() ->
 get(Byte) ->
 	case ar_sync_record:get_interval(Byte + 1, ?MODULE) of
 		not_found ->
+			?LOG_WARNING([{event, ar_sync_record_get_interval_failed},
+				{byte, Byte}]),
 			not_found;
 		{_End, IntervalStart} ->
 			Start = Byte - (Byte - IntervalStart) rem ?DATA_CHUNK_SIZE,

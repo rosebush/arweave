@@ -310,6 +310,8 @@ get(Byte, Start, Key) ->
 		undefined ->
 			case ets:lookup(chunk_storage_file_index, Key) of
 				[] ->
+					?LOG_WARNING([{event, lookup_chunk_file_index_failed},
+						{key, Key}]),
 					not_found;
 				[{_, Filename}] ->
 					read_chunk(Byte, Start, Key, Filename)
@@ -324,6 +326,8 @@ read_chunk(Byte, Start, Key, Filename) ->
 	Filepath = ar_multi_dir:get_read_filename([DataDir, ?CHUNK_DIR, Filename]),
 	case file:open(Filepath, [read, raw, binary]) of
 		{error, enoent} ->
+			?LOG_WARNING([{event, open_chunk_file_failed},
+				{filepath, Filepath}]),
 			not_found;
 		{error, Reason} ->
 			?LOG_ERROR([

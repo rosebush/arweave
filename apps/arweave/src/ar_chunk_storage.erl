@@ -359,6 +359,9 @@ read_chunk3(Byte, Position, LeftChunkBorder, File) ->
 						LeftChunkBorder + (ChunkOffset rem ?DATA_CHUNK_SIZE) + ?DATA_CHUNK_SIZE,
 					{EndOffset, Chunk};
 				false ->
+					?LOG_WARNING([{event, read_chunk_offset_not_valid},
+						{chunkOffset, ChunkOffset}
+					]),
 					not_found
 			end;
 		{error, Reason} ->
@@ -370,6 +373,10 @@ read_chunk3(Byte, Position, LeftChunkBorder, File) ->
 			]),
 			not_found;
 		eof ->
+			?LOG_WARNING([{event, read_chunk_file_failed},
+				{file, File},
+				{position, Position}
+			]),
 			not_found
 	end.
 

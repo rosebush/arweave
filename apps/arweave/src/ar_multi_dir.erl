@@ -26,11 +26,16 @@ get_read_filename(Components) ->
     end.
 
 get_write_filename(Components) ->
-    case application:get_env(arweave, config) of
-        {ok, Config} ->
-            get_best_dir(Components,Config#config.chunk_directories);
-        _ ->
-            get_best_dir(Components,[])
+    TryReadFile = get_read_filename(Components),
+    case filelib:is_file(TryReadFile) of
+        true -> TryReadFile;
+        false ->
+            case application:get_env(arweave, config) of
+                {ok, Config} ->
+                    get_best_dir(Components,Config#config.chunk_directories);
+                _ ->
+                    get_best_dir(Components,[])
+            end
     end.
 
 get_best_dir([DataDir,ChunkDir,Filename],[First | Others]) ->

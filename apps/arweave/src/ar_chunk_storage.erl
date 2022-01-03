@@ -326,7 +326,6 @@ read_chunk(Byte, Start, Key, Filename) ->
 	{ok, Config} = application:get_env(arweave, config),
 	DataDir = Config#config.data_dir,
 	Filepath = ar_multi_dir:get_read_filename([DataDir, ?CHUNK_DIR, Filename]),
-	io:format("read_chunk: ~p~n",[Filepath]),
 	case file:open(Filepath, [read, raw, binary]) of
 		{error, enoent} ->
 			?LOG_WARNING([{event, open_chunk_file_failed},
@@ -341,10 +340,6 @@ read_chunk(Byte, Start, Key, Filename) ->
 			not_found;
 		{ok, File} ->
 			Result = read_chunk2(Byte, Start, Key, File),
-			case Result of 
-				not_found ->
-					?LOG_WARNING([{event, read_chunk2_failed},{filepath,   Filepath}])	
-			end,
 			file:close(File),
 			Result
 	end.
